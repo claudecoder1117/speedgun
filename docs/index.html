@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Doppler Speed Gun</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; background: #0a0a0a; }
+  body {
+    font-family: -apple-system, system-ui, sans-serif;
+    color: #eee;
+    min-height: 100vh;
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 14px 16px 40px;
+    display: flex;
+    flex-direction: column;
+  }
+  h1 {
+    font-size: 1.2em;
+    text-align: center;
+    margin: 4px 0 6px;
+    color: #4a9eff;
+    letter-spacing: 0.05em;
+  }
+  .speed {
+    font-size: min(28vw, 9em);
+    font-weight: 900;
+    text-align: center;
+    line-height: 1;
+    margin: 18px 0 0;
+    font-variant-numeric: tabular-nums;
+    color: #fff;
+  }
+  .unit-line {
+    text-align: center;
+    color: #888;
+    font-size: 1.1em;
+    margin-bottom: 14px;
+    height: 1.5em;
+  }
+  .ctrl-row {
+    display: flex;
+    gap: 10px;
+    margin: 6px 0;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+  button {
+    font-size: 1.05em;
+    padding: 14px 30px;
+    background: #4a9eff;
+    color: #fff;
+    border: none;
+    border-radius: 12px;
+    font-weight: 600;
+    min-width: 120px;
+  }
+  button:disabled { background: #2a2a2a; color: #555; }
+  button.stop { background: #e05353; }
+  .status {
+    text-align: center;
+    color: #aaa;
+    padding: 6px;
+    font-size: 0.88em;
+    min-height: 2.8em;
+  }
+  canvas {
+    width: 100%;
+    height: 130px;
+    background: #000;
+    display: block;
+    border-radius: 8px;
+    margin: 6px 0 8px;
+  }
+  details {
+    background: #141414;
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin: 8px 0;
+    font-size: 0.92em;
+  }
+  summary { cursor: pointer; color: #4a9eff; padding: 2px 0; }
+  label { display: block; margin: 8px 0 4px; color: #bbb; }
+  input[type="number"], select {
+    width: 100%;
+    background: #1c1c1c;
+    color: #eee;
+    border: 1px solid #333;
+    padding: 8px;
+    border-radius: 6px;
+    font-size: 1em;
+  }
+  .diag {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.78em;
+    color: #666;
+    margin-top: 8px;
+  }
+  .info {
+    color: #888;
+    font-size: 0.82em;
+    padding: 6px 4px;
+    line-height: 1.5;
+  }
+  .info strong { color: #ccc; }
+  .info code {
+    background: #1c1c1c;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 0.92em;
+  }
+</style>
+</head>
+<body>
+<h1>DOPPLER SPEED GUN</h1>
+
+<div class="speed" id="speed">—</div>
+<div class="unit-line" id="unitLine">mph</div>
+
+<div class="ctrl-row">
+  <button id="startBtn">Start</button>
+  <button id="stopBtn" class="stop" disabled>Stop</button>
+</div>
+
+<div class="status" id="status">Tap Start. Point at something moving.</div>
+
+<canvas id="spectrum"></canvas>
+
+<details>
+  <summary>Settings</summary>
+  <label>Mode
+    <select id="modeSel">
+      <option value="both" selected>Both — emit + listen (one device)</option>
+      <option value="listen">Listen only — another device emits</option>
+      <option value="emit">Emit only — another device listens</option>
+    </select>
+  </label>
+  <label>Carrier frequency (Hz)
+    <input type="number" id="carrierIn" value="18000" min="12000" max="22000" step="500">
+  </label>
+  <label>Units
+    <select id="unitSel">
+      <option value="mph" selected>mph</option>
+      <option value="kmh">km/h</option>
+      <option value="mps">m/s</option>
+    </select>
+  </label>
+  <div class="diag" id="diag">—</div>
+</details>
+
+<div class="info">
+  <p>Emits a ~18 kHz tone (near the top of adult hearing) and measures the Doppler shift of its reflection off a moving object. Works best at close range on larger objects — you walking, a passing car, a thrown ball. Small fast objects like hockey pucks are inconsistent.</p>
+  <p><strong>iPhone note:</strong> Safari routes speaker output to the quiet earpiece when the mic is active. If Both mode stays at <code>—</code>, open the page on a laptop in <em>Emit only</em> and on the iPhone in <em>Listen only</em>. The math is identical either way.</p>
+</div>
+
+<script>
+(() => {
+  const C_AIR = 343;
+  const MPS_TO_MPH = 2.23694;
+  const MPS_TO_KMH = 3.6;
+  const FFT_SIZE = 16384;
+  const CARRIER_SEARCH_HZ = 500;
+  const CARRIER_NOTCH_HZ = 30;
+  const TARGET_BW_HZ = 5000;
+  const MIN_PEAK_DB = -95;
+  const MIN_CARRIER_DB = -80;
+  const EMA = 0.35;
+
+  const el = id => document.getElementById(id);
+  const speedEl = el('speed');
+  const unitLineEl = el('unitLine');
+  const statusEl = el('status');
+  const startBtn = el('startBtn');
+  const stopBtn = el('stopBtn');
+  const canvas = el('spectrum');
+  const modeSel = el('modeSel');
+  const carrierIn = el('carrierIn');
+  const unitSel = el('unitSel');
+  const diagEl = el('diag');
+  const ctx2d = canvas.getContext('2d');
+
+  let audioCtx = null, analyser = null, oscillator = null;
+  let micSource = null, stream = null, osciGain = null;
+  let running = false, rafId = null;
+  let smoothedSpeed = 0;
+
+  startBtn.addEventListener('click', async () => {
+    try { await start(); }
+    catch (e) { statusEl.textContent = 'Error: ' + (e.message || e); console.error(e); stop(); }
+  });
+  stopBtn.addEventListener('click', stop);
+
+  unitSel.addEventListener('change', () => {
+    if (!running) unitLineEl.textContent = unitName();
+  });
+
+  function unitName() {
+    return unitSel.value === 'mps' ? 'm/s'
+         : unitSel.value === 'kmh' ? 'km/h' : 'mph';
+  }
+
+  async function start() {
+    const mode = modeSel.value;
+    const f0 = parseInt(carrierIn.value, 10);
+    if (!(f0 >= 12000 && f0 <= 22000)) throw new Error('carrier must be 12–22 kHz');
+
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+    if (mode !== 'emit') {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        }
+      });
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = FFT_SIZE;
+      analyser.smoothingTimeConstant = 0;
+      micSource = audioCtx.createMediaStreamSource(stream);
+      micSource.connect(analyser);
+    }
+
+    if (mode !== 'listen') {
+      oscillator = audioCtx.createOscillator();
+      oscillator.type = 'sine';
+      oscillator.frequency.value = f0;
+      osciGain = audioCtx.createGain();
+      osciGain.gain.setValueAtTime(0, audioCtx.currentTime);
+      osciGain.gain.linearRampToValueAtTime(0.95, audioCtx.currentTime + 0.15);
+      oscillator.connect(osciGain).connect(audioCtx.destination);
+      oscillator.start();
+    }
+
+    running = true;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    statusEl.textContent = {
+      both: 'Running — emitting ' + f0 + ' Hz + listening. Move something toward the phone.',
+      listen: 'Listening for ~' + f0 + ' Hz from another device.',
+      emit: 'Emitting ' + f0 + ' Hz. Point speaker at the listening device.',
+    }[mode];
+    diagEl.textContent = `sample rate=${audioCtx.sampleRate} Hz  •  fft=${FFT_SIZE}  •  bin=${(audioCtx.sampleRate/FFT_SIZE).toFixed(2)} Hz  •  max range≈${((audioCtx.sampleRate/2 - f0) / (2*f0) * C_AIR * MPS_TO_MPH).toFixed(0)} mph`;
+
+    smoothedSpeed = 0;
+    if (mode !== 'emit') loop();
+  }
+
+  function stop() {
+    running = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+    try { if (oscillator) oscillator.stop(); } catch (e) {}
+    try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+    try { if (audioCtx && audioCtx.state !== 'closed') audioCtx.close(); } catch (e) {}
+    audioCtx = analyser = oscillator = micSource = stream = osciGain = null;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    speedEl.textContent = '—';
+    unitLineEl.textContent = unitName();
+    statusEl.textContent = 'Stopped.';
+    smoothedSpeed = 0;
+    ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+  }
+
+  function loop() {
+    if (!running || !analyser) return;
+    const N = analyser.frequencyBinCount;
+    const data = new Float32Array(N);
+    analyser.getFloatFrequencyData(data);
+    const sr = audioCtx.sampleRate;
+    const binHz = sr / analyser.fftSize;
+    const f0Target = parseInt(carrierIn.value, 10);
+
+    // Find actual carrier bin near target (device playback may drift slightly).
+    const cLo = Math.max(0, Math.floor((f0Target - CARRIER_SEARCH_HZ) / binHz));
+    const cHi = Math.min(N - 1, Math.ceil((f0Target + CARRIER_SEARCH_HZ) / binHz));
+    let cIdx = cLo, cMax = -Infinity;
+    for (let i = cLo; i <= cHi; i++) {
+      if (data[i] > cMax) { cMax = data[i]; cIdx = i; }
+    }
+    const cHz = cIdx * binHz;
+
+    // Search both sidebands for reflection peak.
+    const notch = Math.max(1, Math.ceil(CARRIER_NOTCH_HZ / binHz));
+    const uLo = cIdx + notch;
+    const uHi = Math.min(N - 1, Math.floor((cHz + TARGET_BW_HZ) / binHz));
+    const lHi = cIdx - notch;
+    const lLo = Math.max(0, Math.floor((cHz - TARGET_BW_HZ) / binHz));
+
+    let pIdx = -1, pDb = -Infinity;
+    for (let i = uLo; i <= uHi; i++) {
+      if (data[i] > pDb) { pDb = data[i]; pIdx = i; }
+    }
+    for (let i = lLo; i <= lHi; i++) {
+      if (data[i] > pDb) { pDb = data[i]; pIdx = i; }
+    }
+
+    const carrierOk = cMax >= MIN_CARRIER_DB;
+    const peakOk = pIdx >= 0 && pDb >= MIN_PEAK_DB;
+
+    if (!carrierOk) {
+      speedEl.textContent = '—';
+      unitLineEl.textContent = 'no carrier';
+      smoothedSpeed = 0;
+    } else if (!peakOk) {
+      speedEl.textContent = '0.0';
+      unitLineEl.textContent = unitName();
+      smoothedSpeed = 0;
+    } else {
+      const pHz = pIdx * binHz;
+      const v = C_AIR * (pHz - cHz) / (pHz + cHz);
+      smoothedSpeed = EMA * v + (1 - EMA) * smoothedSpeed;
+      const unit = unitSel.value;
+      const mag = Math.abs(smoothedSpeed);
+      const disp = unit === 'mps' ? mag : unit === 'kmh' ? mag * MPS_TO_KMH : mag * MPS_TO_MPH;
+      speedEl.textContent = disp.toFixed(1);
+      const dir = smoothedSpeed > 0.2 ? ' toward' : smoothedSpeed < -0.2 ? ' away' : '';
+      unitLineEl.textContent = unitName() + dir;
+    }
+
+    drawSpectrum(data, cIdx, pIdx, binHz);
+    rafId = requestAnimationFrame(loop);
+  }
+
+  function drawSpectrum(data, cIdx, pIdx, binHz) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.width = Math.round(canvas.clientWidth * dpr);
+    const h = canvas.height = Math.round(canvas.clientHeight * dpr);
+    ctx2d.fillStyle = '#000';
+    ctx2d.fillRect(0, 0, w, h);
+
+    const cHz = cIdx * binHz;
+    const loHz = Math.max(0, cHz - 6000);
+    const hiHz = cHz + 6000;
+    const loBin = Math.floor(loHz / binHz);
+    const hiBin = Math.min(data.length - 1, Math.ceil(hiHz / binHz));
+    const nBins = hiBin - loBin;
+    const dbMin = -130, dbMax = -20;
+
+    ctx2d.fillStyle = '#1a3f6c';
+    ctx2d.beginPath();
+    ctx2d.moveTo(0, h);
+    for (let i = 0; i < nBins; i++) {
+      const db = data[loBin + i];
+      const y = h * (1 - Math.max(0, Math.min(1, (db - dbMin) / (dbMax - dbMin))));
+      const x = (i / nBins) * w;
+      ctx2d.lineTo(x, y);
+    }
+    ctx2d.lineTo(w, h);
+    ctx2d.closePath();
+    ctx2d.fill();
+
+    ctx2d.lineWidth = Math.max(1, 2 * dpr);
+    const carrierX = ((cIdx - loBin) / nBins) * w;
+    ctx2d.strokeStyle = '#666';
+    ctx2d.beginPath(); ctx2d.moveTo(carrierX, 0); ctx2d.lineTo(carrierX, h); ctx2d.stroke();
+
+    if (pIdx >= 0) {
+      const peakX = ((pIdx - loBin) / nBins) * w;
+      ctx2d.strokeStyle = '#ff5555';
+      ctx2d.beginPath(); ctx2d.moveTo(peakX, 0); ctx2d.lineTo(peakX, h); ctx2d.stroke();
+    }
+  }
+})();
+</script>
+</body>
+</html>
