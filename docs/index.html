@@ -123,6 +123,7 @@
 
 <div class="ctrl-row">
   <button id="startBtn">Start</button>
+  <button id="recalBtn" disabled>Recalibrate</button>
   <button id="stopBtn" class="stop" disabled>Stop</button>
 </div>
 
@@ -162,13 +163,17 @@
   const C_AIR = 343;
   const MPS_TO_MPH = 2.23694;
   const MPS_TO_KMH = 3.6;
-  const FFT_SIZE = 16384;
+  const FFT_SIZE = 32768;            // max AnalyserNode — +3 dB vs 16384
   const CARRIER_SEARCH_HZ = 500;
   const CARRIER_NOTCH_HZ = 30;
   const TARGET_BW_HZ = 5000;
-  const MIN_PEAK_DB = -95;
   const MIN_CARRIER_DB = -80;
-  const EMA = 0.35;
+  const BASELINE_FRAMES = 30;        // ~0.5 s of "no motion" at 60 fps
+  const INTEGRATION_FRAMES = 3;      // incoherent averaging, ~5 dB
+  const CFAR_GUARD_HZ = 15;          // skip bins this close to candidate
+  const CFAR_TRAIN_HZ = 200;         // neighbourhood for noise estimate
+  const PROMINENCE_DB = 6;           // peak must stand this far above local floor
+  const EMA = 0.35;                  // display smoothing
 
   const el = id => document.getElementById(id);
   const speedEl = el('speed');
@@ -176,6 +181,7 @@
   const statusEl = el('status');
   const startBtn = el('startBtn');
   const stopBtn = el('stopBtn');
+  const recalBtn = el('recalBtn');
   const canvas = el('spectrum');
   const modeSel = el('modeSel');
   const carrierIn = el('carrierIn');
@@ -188,11 +194,26 @@
   let running = false, rafId = null;
   let smoothedSpeed = 0;
 
+  // Background subtraction state. Baseline is the average spectrum captured
+  // during the first BASELINE_FRAMES frames (nothing moving). We subtract it
+  // from every live frame so static reflectors (walls, desk, carrier bleed)
+  // cancel out and only moving targets remain.
+  let baselineSum = null;
+  let baselineCount = 0;
+  let baseline = null;
+  // Ring of recent residual spectra for incoherent integration.
+  let residualHistory = [];
+
   startBtn.addEventListener('click', async () => {
     try { await start(); }
     catch (e) { statusEl.textContent = 'Error: ' + (e.message || e); console.error(e); stop(); }
   });
   stopBtn.addEventListener('click', stop);
+  recalBtn.addEventListener('click', () => {
+    if (!running) return;
+    resetBaseline();
+    statusEl.textContent = 'Recalibrating — hold still…';
+  });
 
   unitSel.addEventListener('change', () => {
     if (!running) unitLineEl.textContent = unitName();
@@ -201,6 +222,14 @@
   function unitName() {
     return unitSel.value === 'mps' ? 'm/s'
          : unitSel.value === 'kmh' ? 'km/h' : 'mph';
+  }
+
+  function resetBaseline() {
+    baselineSum = null;
+    baselineCount = 0;
+    baseline = null;
+    residualHistory = [];
+    smoothedSpeed = 0;
   }
 
   async function start() {
@@ -240,14 +269,16 @@
     running = true;
     startBtn.disabled = true;
     stopBtn.disabled = false;
+    recalBtn.disabled = (mode === 'emit');
     statusEl.textContent = {
-      both: 'Running — emitting ' + f0 + ' Hz + listening. Move something toward the phone.',
-      listen: 'Listening for ~' + f0 + ' Hz from another device.',
+      both: 'Calibrating — hold still for ~1 sec…',
+      listen: 'Calibrating — another device should be emitting ~' + f0 + ' Hz.',
       emit: 'Emitting ' + f0 + ' Hz. Point speaker at the listening device.',
     }[mode];
-    diagEl.textContent = `sample rate=${audioCtx.sampleRate} Hz  •  fft=${FFT_SIZE}  •  bin=${(audioCtx.sampleRate/FFT_SIZE).toFixed(2)} Hz  •  max range≈${((audioCtx.sampleRate/2 - f0) / (2*f0) * C_AIR * MPS_TO_MPH).toFixed(0)} mph`;
+    const intMs = (FFT_SIZE / audioCtx.sampleRate * 1000).toFixed(0);
+    diagEl.textContent = `sr=${audioCtx.sampleRate} Hz  •  fft=${FFT_SIZE} (${intMs} ms)  •  bin=${(audioCtx.sampleRate/FFT_SIZE).toFixed(2)} Hz  •  max range≈${((audioCtx.sampleRate/2 - f0) / (2*f0) * C_AIR * MPS_TO_MPH).toFixed(0)} mph`;
 
-    smoothedSpeed = 0;
+    resetBaseline();
     if (mode !== 'emit') loop();
   }
 
@@ -261,10 +292,11 @@
     audioCtx = analyser = oscillator = micSource = stream = osciGain = null;
     startBtn.disabled = false;
     stopBtn.disabled = true;
+    recalBtn.disabled = true;
     speedEl.textContent = '—';
     unitLineEl.textContent = unitName();
     statusEl.textContent = 'Stopped.';
-    smoothedSpeed = 0;
+    resetBaseline();
     ctx2d.clearRect(0, 0, canvas.width, canvas.height);
   }
 
@@ -277,7 +309,7 @@
     const binHz = sr / analyser.fftSize;
     const f0Target = parseInt(carrierIn.value, 10);
 
-    // Find actual carrier bin near target (device playback may drift slightly).
+    // 1. Find actual carrier bin near target (device playback may drift).
     const cLo = Math.max(0, Math.floor((f0Target - CARRIER_SEARCH_HZ) / binHz));
     const cHi = Math.min(N - 1, Math.ceil((f0Target + CARRIER_SEARCH_HZ) / binHz));
     let cIdx = cLo, cMax = -Infinity;
@@ -286,35 +318,98 @@
     }
     const cHz = cIdx * binHz;
 
-    // Search both sidebands for reflection peak.
+    // 2. If we can't even find the carrier, nothing else will work.
+    if (cMax < MIN_CARRIER_DB) {
+      speedEl.textContent = '—';
+      unitLineEl.textContent = 'no carrier';
+      drawSpectrum(data, cIdx, -1, binHz);
+      rafId = requestAnimationFrame(loop);
+      return;
+    }
+
+    // 3. Build baseline from first BASELINE_FRAMES frames (must be motionless).
+    if (baselineCount < BASELINE_FRAMES) {
+      if (!baselineSum) baselineSum = new Float32Array(N);
+      for (let i = 0; i < N; i++) baselineSum[i] += data[i];
+      baselineCount++;
+      if (baselineCount >= BASELINE_FRAMES) {
+        baseline = new Float32Array(N);
+        for (let i = 0; i < N; i++) baseline[i] = baselineSum[i] / baselineCount;
+        baselineSum = null;
+        statusEl.textContent = 'Calibrated. Move something past the phone.';
+      } else {
+        speedEl.textContent = 'CAL';
+        unitLineEl.textContent = Math.round(100 * baselineCount / BASELINE_FRAMES) + '%';
+      }
+      drawSpectrum(data, cIdx, -1, binHz);
+      rafId = requestAnimationFrame(loop);
+      return;
+    }
+
+    // 4. Residual = current - baseline, in dB. Static clutter cancels out;
+    //    moving targets show up as positive spikes above zero.
+    const residual = new Float32Array(N);
+    for (let i = 0; i < N; i++) residual[i] = data[i] - baseline[i];
+
+    // 5. Incoherent integration: average last INTEGRATION_FRAMES residuals.
+    residualHistory.push(residual);
+    if (residualHistory.length > INTEGRATION_FRAMES) residualHistory.shift();
+    const integrated = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      let s = 0;
+      for (const h of residualHistory) s += h[i];
+      integrated[i] = s / residualHistory.length;
+    }
+
+    // 6. Peak-pick in sidebands, excluding a notch around the carrier.
     const notch = Math.max(1, Math.ceil(CARRIER_NOTCH_HZ / binHz));
     const uLo = cIdx + notch;
     const uHi = Math.min(N - 1, Math.floor((cHz + TARGET_BW_HZ) / binHz));
     const lHi = cIdx - notch;
     const lLo = Math.max(0, Math.floor((cHz - TARGET_BW_HZ) / binHz));
-
     let pIdx = -1, pDb = -Infinity;
-    for (let i = uLo; i <= uHi; i++) {
-      if (data[i] > pDb) { pDb = data[i]; pIdx = i; }
-    }
-    for (let i = lLo; i <= lHi; i++) {
-      if (data[i] > pDb) { pDb = data[i]; pIdx = i; }
+    for (let i = uLo; i <= uHi; i++) if (integrated[i] > pDb) { pDb = integrated[i]; pIdx = i; }
+    for (let i = lLo; i <= lHi; i++) if (integrated[i] > pDb) { pDb = integrated[i]; pIdx = i; }
+
+    // 7. CFAR prominence: does the peak stand out from its neighbours?
+    let accepted = false;
+    if (pIdx >= 0) {
+      const guard = Math.max(1, Math.ceil(CFAR_GUARD_HZ / binHz));
+      const train = Math.max(guard + 4, Math.ceil(CFAR_TRAIN_HZ / binHz));
+      let sum = 0, cnt = 0;
+      for (let off = -train; off <= train; off++) {
+        if (Math.abs(off) <= guard) continue;
+        const idx = pIdx + off;
+        if (idx < 0 || idx >= N) continue;
+        sum += integrated[idx]; cnt++;
+      }
+      const localFloor = cnt > 0 ? sum / cnt : -120;
+      accepted = (pDb - localFloor) >= PROMINENCE_DB;
     }
 
-    const carrierOk = cMax >= MIN_CARRIER_DB;
-    const peakOk = pIdx >= 0 && pDb >= MIN_PEAK_DB;
-
-    if (!carrierOk) {
-      speedEl.textContent = '—';
-      unitLineEl.textContent = 'no carrier';
-      smoothedSpeed = 0;
-    } else if (!peakOk) {
-      speedEl.textContent = '0.0';
+    if (!accepted) {
+      // No peak → decay smoothed speed toward zero rather than snapping.
+      smoothedSpeed *= 0.85;
+      const unit = unitSel.value;
+      const mag = Math.abs(smoothedSpeed);
+      const disp = unit === 'mps' ? mag : unit === 'kmh' ? mag * MPS_TO_KMH : mag * MPS_TO_MPH;
+      speedEl.textContent = disp < 0.05 ? '0.0' : disp.toFixed(1);
       unitLineEl.textContent = unitName();
-      smoothedSpeed = 0;
     } else {
-      const pHz = pIdx * binHz;
-      const v = C_AIR * (pHz - cHz) / (pHz + cHz);
+      // 8. Parabolic interpolation for sub-bin accuracy.
+      let peakFreq;
+      if (pIdx > 0 && pIdx < N - 1) {
+        const a = integrated[pIdx - 1], b = integrated[pIdx], c = integrated[pIdx + 1];
+        const denom = a - 2 * b + c;
+        let delta = Math.abs(denom) > 1e-9 ? 0.5 * (a - c) / denom : 0;
+        if (delta < -0.5) delta = -0.5;
+        if (delta > 0.5) delta = 0.5;
+        peakFreq = (pIdx + delta) * binHz;
+      } else {
+        peakFreq = pIdx * binHz;
+      }
+
+      const v = C_AIR * (peakFreq - cHz) / (peakFreq + cHz);
       smoothedSpeed = EMA * v + (1 - EMA) * smoothedSpeed;
       const unit = unitSel.value;
       const mag = Math.abs(smoothedSpeed);
@@ -324,7 +419,7 @@
       unitLineEl.textContent = unitName() + dir;
     }
 
-    drawSpectrum(data, cIdx, pIdx, binHz);
+    drawSpectrum(data, cIdx, accepted ? pIdx : -1, binHz);
     rafId = requestAnimationFrame(loop);
   }
 
