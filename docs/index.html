@@ -165,14 +165,16 @@
   const MPS_TO_KMH = 3.6;
   const FFT_SIZE = 32768;            // max AnalyserNode — +3 dB vs 16384
   const CARRIER_SEARCH_HZ = 500;
-  const CARRIER_NOTCH_HZ = 30;
+  const CARRIER_NOTCH_HZ = 50;       // reject the immediate carrier vicinity (~1 mph)
   const TARGET_BW_HZ = 5000;
   const MIN_CARRIER_DB = -80;
   const BASELINE_FRAMES = 30;        // ~0.5 s of "no motion" at 60 fps
+  const BASELINE_ALPHA = 0.997;      // after init, slowly track drift (~5 s tau)
   const INTEGRATION_FRAMES = 3;      // incoherent averaging, ~5 dB
   const CFAR_GUARD_HZ = 15;          // skip bins this close to candidate
   const CFAR_TRAIN_HZ = 200;         // neighbourhood for noise estimate
-  const PROMINENCE_DB = 6;           // peak must stand this far above local floor
+  const PROMINENCE_DB = 8;           // peak must stand this far above local floor
+  const MIN_RESIDUAL_DB = 3;         // peak must also be clearly positive vs baseline
   const EMA = 0.35;                  // display smoothing
 
   const el = id => document.getElementById(id);
@@ -347,9 +349,15 @@
     }
 
     // 4. Residual = current - baseline, in dB. Static clutter cancels out;
-    //    moving targets show up as positive spikes above zero.
+    //    moving targets show up as positive spikes above zero. After the
+    //    initial capture, the baseline slowly adapts so fluctuating ambient
+    //    noise (fans, air scrubbers) gets tracked out instead of looking
+    //    like motion every time its spectrum shifts.
     const residual = new Float32Array(N);
-    for (let i = 0; i < N; i++) residual[i] = data[i] - baseline[i];
+    for (let i = 0; i < N; i++) {
+      residual[i] = data[i] - baseline[i];
+      baseline[i] = BASELINE_ALPHA * baseline[i] + (1 - BASELINE_ALPHA) * data[i];
+    }
 
     // 5. Incoherent integration: average last INTEGRATION_FRAMES residuals.
     residualHistory.push(residual);
@@ -371,9 +379,10 @@
     for (let i = uLo; i <= uHi; i++) if (integrated[i] > pDb) { pDb = integrated[i]; pIdx = i; }
     for (let i = lLo; i <= lHi; i++) if (integrated[i] > pDb) { pDb = integrated[i]; pIdx = i; }
 
-    // 7. CFAR prominence: does the peak stand out from its neighbours?
+    // 7. Acceptance: peak must be (a) clearly positive vs baseline, AND
+    //    (b) stand out from its local neighbourhood (CFAR prominence).
     let accepted = false;
-    if (pIdx >= 0) {
+    if (pIdx >= 0 && pDb >= MIN_RESIDUAL_DB) {
       const guard = Math.max(1, Math.ceil(CFAR_GUARD_HZ / binHz));
       const train = Math.max(guard + 4, Math.ceil(CFAR_TRAIN_HZ / binHz));
       let sum = 0, cnt = 0;
