@@ -4,3 +4,10 @@ __pycache__/
 .env
 .DS_Store
 *.wav
+
+# Xcode
+ios/build/
+ios/DerivedData/
+ios/**/*.xcuserdata/
+ios/**/*.xcuserstate
+ios/**/xcuserdata/

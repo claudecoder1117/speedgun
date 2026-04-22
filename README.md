@@ -16,6 +16,10 @@ Works best in Safari on iPhone or Chrome on a laptop. Requires HTTPS
 - `docs/index.html` — web tester, served by GitHub Pages.
 - `python/doppler_prototype.py` — DSP prototype with synthetic signals.
   Proves the math before porting to native.
+- `ios/SpeedGun.xcodeproj` — native iOS app (SwiftUI + AVAudioEngine +
+  Accelerate). Open in Xcode on macOS, select your signing team, run on
+  an iPhone. See `ios/README.md` for build instructions and a manual-
+  recreate fallback if the project file doesn't open cleanly.
 
 ## Physics
 
